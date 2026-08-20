@@ -1,81 +1,97 @@
 # containers-custom-prefix-tree
 
 A header-only, STL-inspired C++23 container implementing a **prefix_tree (prefix
-tree)** that maps `std::string` keys to values, with support for `std::pmr`
-allocators. It lives in the `containers::custom` namespace/CMake namespace
-alongside other custom container libraries, so several such libraries can be
-`add_subdirectory()`'d into one umbrella build without target or option name
-clashes.
+tree)** that stores unique *sequences* of `ElementType`, with support for
+`std::pmr` allocators. `prefix_tree<char>` is to `std::set<std::string>`
+roughly what `std::string` is to `std::vector<char>`. It lives in the
+`containers::custom` namespace/CMake namespace alongside other custom
+container libraries, so several such libraries can be `add_subdirectory()`'d
+into one umbrella build without target or option name clashes.
 
 ```cpp
 #include <containers/custom/prefix_tree.hpp>
 
-containers::custom::prefix_tree<int> word_count;
-++word_count["fox"];
-++word_count["fox"];
-++word_count["dog"];
+using namespace std::string_view_literals;
 
-for (const auto& [key, value] : word_count) {
-    // iterates in lexicographic key order: dog, fox
+containers::custom::prefix_tree<char> words;
+words.insert("fox"sv);
+words.insert("dog"sv);
+
+for (const auto& entry : words) {
+    // iterates in lexicographic order: dog, fox
+    // `entry` is a zero-copy view, not a std::string -- see below
 }
 
-auto [first, last] = word_count.prefix_range("fo");
-// [first, last) yields every key starting with "fo"
+auto [first, last] = words.prefix_range("fo"sv);
+// [first, last) yields every stored sequence starting with "fo"
 ```
 
-## Why a prefix tree, not `std::map<std::string, T>`
+## Why a prefix tree, not `std::set<std::string>`
 
-A `prefix_tree` stores keys character-by-character along paths from the root, so
-besides the usual associative-container operations it can answer
+A `prefix_tree` stores each sequence element-by-element along a path from the
+root, so besides the usual associative-container operations it can answer
 prefix-shaped questions directly, without scanning the whole container:
 
-- `starts_with(prefix)` -- does any key begin with `prefix`?
-- `prefix_range(prefix)` -- `[begin, end)` iterator pair over every key
-  beginning with `prefix`, in lexicographic order (an "autocomplete" query).
-- `erase_prefix(prefix)` -- remove every key beginning with `prefix` in one
-  call, returning how many were removed.
+- `starts_with(prefix)` -- does any stored sequence begin with `prefix`?
+- `prefix_range(prefix)` -- `[begin, end)` iterator pair over every stored
+  sequence beginning with `prefix`, in lexicographic order (an
+  "autocomplete" query).
+- `erase_prefix(prefix)` -- remove every sequence beginning with `prefix` in
+  one call, returning how many were removed.
 
 ## Allocator support
 
-`prefix_tree<T, Allocator>` defaults to `std::pmr::polymorphic_allocator<std::byte>`,
-so every node is allocated through whatever `std::pmr::memory_resource` you
-provide -- an arena, a pool, a monotonic buffer -- letting you control and
-often eliminate heap traffic:
+`prefix_tree<ElementType, Allocator>` defaults to
+`std::pmr::polymorphic_allocator<ElementType>`, so every node is allocated
+through whatever `std::pmr::memory_resource` you provide -- an arena, a
+pool, a monotonic buffer -- letting you control and often eliminate heap
+traffic:
 
 ```cpp
 std::array<std::byte, 4096> buffer{};
 std::pmr::monotonic_buffer_resource arena(buffer.data(), buffer.size());
-containers::custom::prefix_tree<int> t{&arena};   // every node comes out of `buffer`
+containers::custom::prefix_tree<char> t{&arena};   // every node comes out of `buffer`
 ```
 
 The container is templated on the allocator type, so a plain
-`std::allocator<std::byte>` (or any type satisfying the standard `Allocator`
-requirements) also works.
+`std::allocator<char>` (or any type satisfying the standard `Allocator`
+requirements) also works. Allocator propagation on copy/move
+assignment/swap follows `std::allocator_traits`' `propagate_on_container_*`
+traits, exactly like the standard `std::pmr` containers -- which is also
+why `std::pmr::polymorphic_allocator` (whose `operator=` is deleted) is
+usable as the allocator at all.
 
-## What it looks like vs. `std::map`
+## What it looks like vs. `std::set`
 
-The public interface deliberately mirrors `std::map`/`std::unordered_map`
-where the concepts line up:
+The public interface deliberately mirrors `std::set` where the concepts
+line up, generalized from a single comparable value to a sequence of them:
 
 | | |
 |---|---|
-| `insert`, `emplace`, `erase`, `clear`, `swap` | modifiers |
-| `find`, `count`, `contains`, `at`, `operator[]` | lookup |
-| `begin`/`end`/`cbegin`/`cend`, forward iteration | traversal, sorted by key |
+| `insert`, `erase`, `clear`, `swap` | modifiers |
+| `find`, `count`, `contains` | lookup |
+| `begin`/`end`/`cbegin`/`cend`, forward iteration | traversal, lexicographic order |
 | `empty`, `size`, `max_size` | capacity |
 | copy/move construction & assignment, `operator==` | value semantics |
 
-**One deliberate deviation:** because a key is never stored contiguously
-anywhere (it's spelled out by the path from the root to a node), dereferencing
-an iterator does not yield a real `std::pair<const Key, T>&`. It yields a
-small proxy reference type with `.first` (`const std::string&`) and `.second`
-(`T&`, or `const T&` for `const_iterator`) members, reconstructed as the
-iterator walks the tree. This is transparent for the common `it->first`,
-`it->second`, structured-binding (`for (auto& [k, v] : t)`) usage patterns,
-but the type is not a literal `std::pair`, so passing `*it` to something that
-requires exactly that type won't compile.
+Any `std::ranges::input_range` whose value type is `ElementType` -- a
+`std::string`, `std::string_view`, `std::vector<T>`, `std::array<T, N>`, and
+so on -- can be passed to any of these.
 
-Iterator invalidation is looser than `std::map`'s node-stability guarantee:
+**One deliberate deviation:** because a stored sequence is never kept
+contiguously anywhere (it's spelled out by the path from the root to a
+node), dereferencing an iterator does not yield a real
+`const Sequence&`. It yields a `prefix_tree_element_view`, a small
+zero-copy proxy that is itself a range over `const ElementType&`,
+reconstructed by reading straight out of the tree's own nodes as you
+iterate. This is transparent for the common `for (auto element : view)`,
+streaming (`os << view`), and range-comparison (`view == "arthur"sv`)
+usage patterns, but the type is not a literal `std::string` (or whatever
+sequence type you inserted), so passing `*it` to something that requires
+exactly that type won't compile -- and the view is only valid for as long
+as the iterator that produced it is alive and hasn't been advanced.
+
+Iterator invalidation is looser than `std::set`'s node-stability guarantee:
 inserting or erasing may reallocate a node's internal children vector, so
 treat mutation as invalidating other iterators into the same container,
 similar to `std::vector` -- *except* for the iterator you are currently
@@ -101,7 +117,7 @@ external synchronization:
   accessors from the same thread without deadlocking.
 
 ```cpp
-containers::custom::prefix_tree<int> shared_tree;
+containers::custom::prefix_tree<char> shared_tree;
 // ... populated from elsewhere ...
 
 {
@@ -114,7 +130,7 @@ containers::custom::prefix_tree<int> shared_tree;
 
 This is implemented by `prefix_tree` privately inheriting the locking
 machinery from `containers::custom::detail::mutex_guarded`, and by
-`containers::custom::detail::trie_iterator` holding a
+`containers::custom::detail::prefix_tree_iterator` holding a
 `std::shared_ptr<std::unique_lock<std::recursive_mutex>>`. See the Doxygen
 comments on both for the full rationale.
 
@@ -179,19 +195,13 @@ qualified precisely so they don't collide with a sibling
 `containers::custom` library's own `..._BUILD_TESTS` option in a combined
 build.
 
-The suite (45 cases, ~4300 assertions) covers ordinary usage, every
-constructor/assignment/allocator-propagation combination, exception safety
-under injected allocation and value-construction failures (verified leak-free
-under AddressSanitizer), and concurrency (verified race-free under
-ThreadSanitizer): concurrent inserts from multiple threads, concurrent reads,
-and a timing-based test that a live iterator's lock actually blocks a
-concurrent writer. Measured with `gcovr`, coverage is ~96% lines / ~99%
-functions; the only lines it can't reach are two compiler-generated function
-epilogues that are demonstrably exercised by hundreds of other passing
-assertions (a known quirk of line-based coverage on `-O0`-compiled template
-code), and the handful of remaining gaps are allocator-exception-injection
-branches so defensive they'd need a deliberately pathological allocator to
-reach at all.
+The suite (15 cases, ~55 assertions) covers ordinary usage -- insert, find,
+contains, iteration order, `starts_with`/`prefix_range`/`erase_prefix`,
+`erase` by key and by iterator, copy/move construction, `operator==`, and
+`swap` -- and has been run clean under AddressSanitizer+UndefinedBehaviorSanitizer.
+It does not yet include dedicated exception-safety-under-injected-failure or
+concurrency/ThreadSanitizer tests despite the thread-safety machinery
+described above being implemented; that coverage is a good next addition.
 
 ```sh
 cmake -S . -B build-coverage -DCONTAINERS_CUSTOM_PREFIX_TREE_COVERAGE=ON
@@ -208,19 +218,15 @@ cmake --build build --target containers_custom_prefix_tree_benchmarks
 ./build/benchmarks/containers_custom_prefix_tree_benchmarks
 ```
 
-[Google Benchmark](https://github.com/google/benchmark) (fetched via CMake)
-compares `prefix_tree` against `std::map` and `std::unordered_map` for
-insert/find/erase/iterate, and compares `prefix_range()` against a
-`std::map::lower_bound`-based prefix scan and a naive linear scan. Headline,
-honest findings from a local run: single-key lookup and point mutation sit
-between `std::map` and `std::unordered_map` (the mutex adds real overhead
-`std::unordered_map` doesn't pay); full-range iteration and large
-`prefix_range()` scans are markedly slower than `std::map`'s, since each
-`operator++` reconstructs part of the key and walks separately-allocated
-nodes rather than following a single balanced tree's pointers. The trie's own
-advantage shows up in `starts_with()`/existence-style prefix checks
-(`O(prefix length)`, independent of container size) and in scenarios needing
-prefix queries at all, which `std::unordered_map` cannot support without a
+`benchmarks/bench_prefix_tree.cpp` is currently a placeholder (it links and
+runs, but contains no actual benchmarks yet). The intent, once filled in
+with [Google Benchmark](https://github.com/google/benchmark), is to compare
+`prefix_tree` against `std::set<std::string>` and `std::unordered_set<std::string>`
+for insert/find/erase/iterate, and to compare `prefix_range()` against a
+`std::set::lower_bound`-based prefix scan and a naive linear scan -- the
+trie's own expected advantage being `starts_with()`/existence-style prefix
+checks (`O(prefix length)`, independent of container size) and prefix
+queries in general, which `std::unordered_set` cannot support without a
 full scan. Pass `-DCONTAINERS_CUSTOM_PREFIX_TREE_BUILD_BENCHMARKS=OFF` to
 skip building this target as a subdirectory dependency.
 
@@ -242,26 +248,42 @@ and pull request, independent of the Pages deployment.
 ```cpp
 namespace containers::custom {
 
-template <class T, class Allocator = std::pmr::polymorphic_allocator<std::byte>>
+template <class ElementType,
+          class Allocator = std::pmr::polymorphic_allocator<ElementType>>
 class prefix_tree {
 public:
-    using key_type      = std::string;
-    using mapped_type    = T;
-    using value_type     = std::pair<key_type, mapped_type>;
+    using element_type   = ElementType;
     using allocator_type = Allocator;
-    using iterator        = /* forward iterator, proxy reference */;
-    using const_iterator  = /* forward iterator, proxy const reference */;
+    using size_type       = std::size_t;
+    using iterator         = /* forward iterator, element_view reference */;
+    using const_iterator   = iterator;
+    using element_view     = /* zero-copy view over a stored sequence */;
 
-    // construction, copy/move, allocator-extended overloads, initializer_list
-    // iteration: begin/end/cbegin/cend
-    // capacity: empty/size/max_size
-    // modifiers: clear/insert/emplace/erase/swap
-    // element access: at/operator[]
-    // lookup: find/count/contains
+    // construction: default, allocator, initializer_list<Sequence>,
+    // copy/move construction & assignment (allocator-propagation aware)
 
-    bool starts_with(std::string_view prefix) const;
-    std::pair<iterator, iterator> prefix_range(std::string_view prefix);
-    std::size_t erase_prefix(std::string_view prefix);
+    iterator begin() const; iterator end() const;
+    iterator cbegin() const; iterator cend() const;
+
+    bool empty() const; size_type size() const; size_type max_size() const;
+    void clear(); void swap(prefix_tree& other) noexcept;
+
+    // Sequence is any std::ranges::input_range<ElementType>
+    // (std::string, std::string_view, std::vector<T>, ...)
+    template <class Sequence> std::pair<iterator, bool> insert(const Sequence&);
+    template <class Sequence> size_type erase(const Sequence&);
+    iterator erase(iterator pos);
+
+    template <class Sequence> iterator find(const Sequence&) const;
+    template <class Sequence> bool contains(const Sequence&) const;
+    template <class Sequence> size_type count(const Sequence&) const;
+
+    template <class Sequence> bool starts_with(const Sequence& prefix) const;
+    template <class Sequence>
+    std::pair<iterator, iterator> prefix_range(const Sequence& prefix) const;
+    template <class Sequence> size_type erase_prefix(const Sequence& prefix);
+
+    friend bool operator==(const prefix_tree&, const prefix_tree&);
 };
 
 }  // namespace containers::custom

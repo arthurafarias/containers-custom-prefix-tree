@@ -2,922 +2,609 @@
  * @file prefix_tree.hpp
  * @brief Header-only, PMR-aware prefix_tree (prefix tree) container.
  *
- * Defines containers::custom::prefix_tree<T, Allocator>, an STL-inspired associative
- * container mapping `std::string` keys to `T` values via a character-indexed
- * prefix tree. Node layout and iterator machinery live in
- * containers::custom::detail (see containers/custom/detail/) and are not
- * part of the public API: they may change between releases without notice.
+ * Defines containers::custom::prefix_tree<ElementType, Allocator>, an
+ * STL-inspired container storing sequences of `ElementType` (e.g.
+ * `prefix_tree<char>` behaves like a `std::set<std::string>`) in a
+ * character/element-indexed prefix tree. Node layout and iterator machinery
+ * live in containers::custom::detail (see below) and are not part of the
+ * public API: they may change between releases without notice.
  */
 
 #pragma once
 
 #include <algorithm>
+#include <concepts>
 #include <cstddef>
 #include <initializer_list>
+#include <limits>
 #include <memory>
 #include <memory_resource>
 #include <mutex>
-#include <stdexcept>
-#include <string>
-#include <string_view>
-#include <type_traits>
+#include <optional>
+#include <ostream>
+#include <ranges>
 #include <utility>
 #include <vector>
 
 #include <containers/custom/detail/mutex_guarded.hpp>
-#include <containers/custom/detail/trie_frame.hpp>
-#include <containers/custom/detail/trie_iterator.hpp>
-#include <containers/custom/detail/trie_node.hpp>
+
+namespace containers::custom {
+
+template <typename ElementType,
+          typename Allocator = std::pmr::polymorphic_allocator<ElementType>>
+class prefix_tree;
+
+} // namespace containers::custom
+
+namespace containers::custom::detail {
 
 /**
- * @namespace containers::custom
- * @brief Custom (non-standard-library), STL-inspired containers.
+ * @brief A single node of the tree: one `ElementType` along some stored
+ *        sequence's path from the root, plus whether a sequence terminates
+ *        here and the (lexicographically sorted) children continuing it.
+ *
+ * The root node itself carries no element (`element` is `std::nullopt`) --
+ * it is only ever the anchor children hang off of.
  */
+template <typename ElementType> struct prefix_tree_node {
+  std::optional<ElementType> element;
+  bool is_end = false;
+  std::vector<std::shared_ptr<prefix_tree_node<ElementType>>> children;
+};
+
+/**
+ * @brief One frame of a root-to-node path: the node itself, plus the index
+ *        of the next child of that node still left to explore.
+ *
+ * `prefix_tree_iterator` keeps a stack of these instead of giving nodes a
+ * parent pointer: a parent pointer would form a shared_ptr reference cycle
+ * with the `children` vector that already owns the node (parent -> child
+ * via `children`, child -> parent would never let refcounts reach zero).
+ * The stack is also exactly the "root-to-current-node path", which is what
+ * `prefix_tree_element_view` needs to present as a sequence -- so it does
+ * double duty as both the iterator's backtracking state and the view's
+ * backing storage, at no extra cost.
+ */
+template <typename ElementType> struct path_frame {
+  prefix_tree_node<ElementType> *node;
+  std::size_t next_child;
+};
+
+/**
+ * @brief A read-only, zero-copy view of one stored sequence.
+ *
+ * Dereferencing a `prefix_tree_iterator` yields one of these: it does not
+ * copy any `ElementType` out of the tree, it simply spans the relevant
+ * slice of the iterator's own path-frame stack and reads each node's
+ * `element` in place. It is therefore only valid for as long as the
+ * iterator that produced it is alive and has not been advanced.
+ */
+template <typename ElementType> class prefix_tree_element_view {
+public:
+  class iterator {
+  public:
+    using iterator_category = std::forward_iterator_tag;
+    using value_type = ElementType;
+    using difference_type = std::ptrdiff_t;
+    using reference = const ElementType &;
+    using pointer = const ElementType *;
+
+    iterator() = default;
+    explicit iterator(const path_frame<ElementType> *frame) : frame_(frame) {}
+
+    reference operator*() const { return *frame_->node->element; }
+
+    iterator &operator++() {
+      ++frame_;
+      return *this;
+    }
+    iterator operator++(int) {
+      iterator tmp(*this);
+      ++*this;
+      return tmp;
+    }
+
+    bool operator==(const iterator &) const = default;
+
+  private:
+    const path_frame<ElementType> *frame_ = nullptr;
+  };
+
+  using const_iterator = iterator;
+  using value_type = ElementType;
+
+  prefix_tree_element_view() = default;
+  prefix_tree_element_view(const path_frame<ElementType> *first,
+                            const path_frame<ElementType> *last)
+      : first_(first), last_(last) {}
+
+  iterator begin() const { return iterator(first_); }
+  iterator end() const { return iterator(last_); }
+
+  [[nodiscard]] bool empty() const { return first_ == last_; }
+  std::size_t size() const {
+    return static_cast<std::size_t>(last_ - first_);
+  }
+
+private:
+  const path_frame<ElementType> *first_ = nullptr;
+  const path_frame<ElementType> *last_ = nullptr;
+};
+
+template <typename ElementType, std::ranges::input_range Range>
+bool operator==(const prefix_tree_element_view<ElementType> &view,
+                const Range &other) {
+  return std::ranges::equal(view, other);
+}
+
+template <typename ElementType>
+bool operator==(const prefix_tree_element_view<ElementType> &lhs,
+                 const prefix_tree_element_view<ElementType> &rhs) {
+  return std::ranges::equal(lhs, rhs);
+}
+
+template <typename ElementType>
+std::ostream &operator<<(std::ostream &os,
+                          const prefix_tree_element_view<ElementType> &view) {
+  for (const auto &element : view) {
+    os << element;
+  }
+  return os;
+}
+
+/**
+ * @brief Forward DFS iterator over the terminal (`is_end`) nodes of a
+ *        prefix_tree, in lexicographic order.
+ *
+ * Holds its own `std::vector<path_frame<ElementType>>` root-to-current-node
+ * path. Because that path is owned by the iterator itself (not shared with
+ * any other iterator or the tree), copying an iterator copies its path and
+ * yields a fully independent, still-valid iterator -- satisfying
+ * `std::forward_iterator` despite the proxy `element_view` reference type,
+ * which C++20's iterator concepts (unlike the pre-C++20 named
+ * requirements) explicitly allow.
+ *
+ * `min_depth_` bounds backtracking: ordinary whole-tree iteration never
+ * pops back past the root frame (`min_depth_ == 1`); `prefix_range()`
+ * reuses the exact same mechanism with `min_depth_` set to the depth of the
+ * prefix's node, so iteration never escapes that subtree.
+ */
+template <typename ElementType> class prefix_tree_iterator {
+public:
+  using node_type = prefix_tree_node<ElementType>;
+  using frame_type = path_frame<ElementType>;
+  using iterator_category = std::forward_iterator_tag;
+  using value_type = prefix_tree_element_view<ElementType>;
+  using difference_type = std::ptrdiff_t;
+  using reference = value_type;
+  using pointer = void;
+
+  prefix_tree_iterator() = default;
+
+  reference operator*() const {
+    return value_type(stack_.data() + 1, stack_.data() + stack_.size());
+  }
+
+  prefix_tree_iterator &operator++() {
+    advance();
+    return *this;
+  }
+  prefix_tree_iterator operator++(int) {
+    prefix_tree_iterator tmp(*this);
+    advance();
+    return tmp;
+  }
+
+  bool operator==(const prefix_tree_iterator &other) const {
+    if (stack_.empty() || other.stack_.empty()) {
+      return stack_.empty() == other.stack_.empty();
+    }
+    return stack_.back().node == other.stack_.back().node;
+  }
+
+private:
+  template <typename ET, typename Alloc>
+  friend class containers::custom::prefix_tree;
+
+  prefix_tree_iterator(
+      std::vector<frame_type> stack, std::size_t min_depth,
+      std::shared_ptr<std::unique_lock<std::recursive_mutex>> lock)
+      : stack_(std::move(stack)), min_depth_(min_depth), lock_(std::move(lock)) {
+    if (!stack_.empty() && !stack_.back().node->is_end) {
+      advance();
+    }
+  }
+
+  void advance() {
+    while (!stack_.empty()) {
+      frame_type &top = stack_.back();
+      if (top.next_child < top.node->children.size()) {
+        node_type *child = top.node->children[top.next_child++].get();
+        stack_.push_back({child, 0});
+        if (child->is_end) {
+          return;
+        }
+      } else if (stack_.size() == min_depth_) {
+        stack_.clear();
+        return;
+      } else {
+        stack_.pop_back();
+      }
+    }
+  }
+
+  std::vector<frame_type> stack_;
+  std::size_t min_depth_ = 0;
+  std::shared_ptr<std::unique_lock<std::recursive_mutex>> lock_;
+};
+
+} // namespace containers::custom::detail
+
 namespace containers::custom {
 
 /**
- * @brief An ordered, associative, STL-inspired container mapping `std::string`
- *        keys to `T` values, structured as a character-indexed prefix tree.
+ * @brief A prefix tree (trie) storing unique sequences of `ElementType`.
  *
- * Iteration visits keys in lexicographic order. Beyond the usual
- * associative-container operations, `prefix_tree` exposes prefix-native queries --
- * starts_with(), prefix_range(), erase_prefix() -- that a hash- or tree-based
- * map cannot offer efficiently, since it stores keys along shared root-to-node
- * paths rather than as opaque, independently-hashed/ordered blobs.
+ * Behaves like an STL associative container in the vein of `std::set`, but
+ * over sequences rather than single values -- `prefix_tree<char>` is to
+ * `std::set<std::string>` roughly what `std::string` is to
+ * `std::vector<char>`. `ElementType` must be `std::totally_ordered` so
+ * children can be kept sorted (this is what gives lexicographic iteration
+ * order and O(log branching-factor) descent per element).
  *
- * `prefix_tree` is *not* a strict implementation of the Container/AssociativeContainer
- * named requirements: because a key is not stored contiguously anywhere (it is
- * spelled out by the path from the root), dereferencing an iterator yields a
- * small proxy reference type (detail::trie_kv_ref) rather than a real
- * `std::pair<const Key, T>&`. Everything else -- insert/erase/find semantics,
- * allocator-awareness, iterator invalidation rules similar to node-based
- * containers -- follows STL conventions.
+ * Any `std::ranges::input_range` whose value type is `ElementType` can be
+ * inserted/looked up: `std::string`, `std::string_view`, `std::vector<T>`,
+ * `std::array<T, N>`, and so on.
  *
- * Thread safety: `prefix_tree` inherits from detail::mutex_guarded, which
- * gives it its own recursive mutex. Every public member function locks it
- * for the duration of the call, so individual calls are safe to make
- * concurrently from multiple threads. Additionally, any iterator returned by
- * an accessor (`begin()`, `find()`, `prefix_range()`, ...) carries a
- * reference-counted RAII lock that keeps the tree from being mutated by
- * another thread for as long as that iterator -- or any copy taken from it
- * -- remains alive, which is what makes it safe to iterate a shared
- * prefix_tree without separately synchronizing the loop. Because the mutex
- * is recursive, code already holding it (whether via a live iterator or an
- * explicit `std::scoped_lock lock(my_prefix_tree);`) can still call further
- * accessors from the same thread without deadlocking.
- *
- * @tparam T         Mapped value type associated with each key.
- * @tparam Allocator An allocator satisfying the standard Allocator named
- *                     requirements, used (after rebinding) to allocate nodes
- *                     and their children storage. Defaults to
- *                     `std::pmr::polymorphic_allocator<std::byte>`, so node
- *                     storage is driven by whatever `std::pmr::memory_resource`
- *                     is supplied at construction.
+ * Dereferencing an iterator does not yield a stored sequence by value; it
+ * yields a `prefix_tree_element_view`, a zero-copy read-only view that
+ * reads each element directly out of the tree's own nodes as you iterate
+ * it. It is valid only transiently -- for as long as the iterator that
+ * produced it is alive and not yet advanced. See detail::prefix_tree_iterator
+ * and detail::prefix_tree_element_view.
  */
-template <class T, class Allocator = std::pmr::polymorphic_allocator<std::byte>>
-class prefix_tree : public detail::mutex_guarded {
-public:
-    /// The key type: sequences of `char`.
-    using key_type = std::string;
-    /// The value type associated with each key.
-    using mapped_type = T;
-    /// Key/value pair type accepted by `insert`/`emplace`-adjacent overloads and initializer lists.
-    using value_type = std::pair<key_type, mapped_type>;
-    /// The allocator type used for node storage.
-    using allocator_type = Allocator;
-    /// Unsigned type used for sizes and counts.
-    using size_type = std::size_t;
-    /// Signed type used for iterator distances.
-    using difference_type = std::ptrdiff_t;
+template <typename ElementType, typename Allocator>
+class prefix_tree : private detail::mutex_guarded {
+  static_assert(std::totally_ordered<ElementType>,
+                "prefix_tree requires ElementType to support operator< and "
+                "operator==, so children can be kept sorted");
 
-private:
-    /// This trie's node type.
-    using node = detail::trie_node<T, Allocator>;
-    /// `Allocator` rebound to `node`, used for all node allocation/deallocation.
-    using node_allocator_type =
-        typename std::allocator_traits<Allocator>::template rebind_alloc<node>;
-    /// `std::allocator_traits` for `node_allocator_type`.
-    using node_alloc_traits = std::allocator_traits<node_allocator_type>;
+  using node_type = detail::prefix_tree_node<ElementType>;
+  using frame_type = detail::path_frame<ElementType>;
+
+  // std::pmr::polymorphic_allocator's operator= is deleted -- it never
+  // propagates implicitly, matching every other std::pmr container. Whether
+  // the allocator itself is reassigned on copy/move/swap is therefore
+  // gated on allocator_traits' propagate_on_container_* traits, exactly as
+  // the standard containers do; for an Allocator type without a deleted
+  // operator= (e.g. std::allocator), these traits default to propagating.
+  using alloc_traits = std::allocator_traits<Allocator>;
 
 public:
-    /// Mutable forward iterator; see the `prefix_tree` class docs for how dereferencing differs from `std::map`.
-    using iterator = detail::trie_iterator<T, Allocator, false>;
-    /// Read-only forward iterator counterpart of `iterator`.
-    using const_iterator = detail::trie_iterator<T, Allocator, true>;
-    /// The proxy type yielded by `*iterator{}`.
-    using reference = typename iterator::reference;
-    /// The proxy type yielded by `*const_iterator{}`.
-    using const_reference = typename const_iterator::reference;
+  using element_type = ElementType;
+  using allocator_type = Allocator;
+  using size_type = std::size_t;
+  using iterator = detail::prefix_tree_iterator<ElementType>;
+  using const_iterator = iterator;
+  using element_view = detail::prefix_tree_element_view<ElementType>;
 
-    /// Constructs an empty prefix_tree using a default-constructed `Allocator`.
-    prefix_tree() : prefix_tree(Allocator()) {}
+  // Re-exposed from the privately-inherited mutex_guarded base: these make
+  // prefix_tree itself satisfy Lockable, so a caller can hold
+  // std::scoped_lock lock(my_tree); across a hand-written multi-step
+  // critical section (see the class docs on mutex_guarded).
+  using detail::mutex_guarded::lock;
+  using detail::mutex_guarded::try_lock;
+  using detail::mutex_guarded::unlock;
 
-    /**
-     * @brief Constructs an empty prefix_tree using the given allocator.
-     * @param alloc Allocator (or, for the default `Allocator`, anything
-     *               convertible to `std::pmr::polymorphic_allocator<std::byte>`,
-     *               such as a `std::pmr::memory_resource*`) to use for all
-     *               node allocations.
-     */
-    explicit prefix_tree(const Allocator& alloc) : allocator_(alloc), root_(create_node()) {}
+  prefix_tree() : prefix_tree(Allocator()) {}
 
-    /**
-     * @brief Copy constructor. Deep-copies `other`'s tree using `other`'s allocator.
-     * @param other The prefix_tree to copy.
-     */
-    prefix_tree(const prefix_tree& other) : prefix_tree(other, other.allocator_) {}
+  explicit prefix_tree(const Allocator &allocator)
+      : allocator_(allocator), root_(allocate_node()) {}
 
-    /**
-     * @brief Allocator-extended copy constructor.
-     * @param other The prefix_tree to copy.
-     * @param alloc Allocator to use for the new prefix_tree's nodes (may differ from `other`'s).
-     */
-    prefix_tree(const prefix_tree& other, const Allocator& alloc)
-        : allocator_(alloc), root_(nullptr), size_(0) {
-        std::scoped_lock other_lock(other);
-        root_ = clone_subtree(other.root_);
-        size_ = other.size_;
+  template <std::ranges::input_range Sequence>
+  prefix_tree(std::initializer_list<Sequence> init,
+              const Allocator &allocator = Allocator())
+      : prefix_tree(allocator) {
+    for (const auto &sequence : init) {
+      insert(sequence);
     }
+  }
 
-    /**
-     * @brief Move constructor. Takes ownership of `other`'s storage in constant time.
-     * @param other The prefix_tree to move from; left empty and safe to destroy or reassign.
-     */
-    prefix_tree(prefix_tree&& other) noexcept
-        : allocator_(std::move(other.allocator_)), root_(other.root_), size_(other.size_) {
-        other.root_ = nullptr;
-        other.size_ = 0;
-    }
+  prefix_tree(const prefix_tree &other)
+      : detail::mutex_guarded(other), allocator_(other.allocator_),
+        root_(clone(other.root_)), size_(other.size_) {}
 
-    /**
-     * @brief Allocator-extended move constructor.
-     *
-     * If `alloc` compares equal to `other`'s allocator, storage is stolen in
-     * constant time; otherwise the tree is deep-copied using `alloc`, since
-     * nodes allocated from a different resource cannot simply be adopted.
-     * @param other The prefix_tree to move (or copy) from.
-     * @param alloc Allocator to use for the new prefix_tree's nodes.
-     */
-    prefix_tree(prefix_tree&& other, const Allocator& alloc) : allocator_(alloc), root_(nullptr), size_(0) {
-        if (alloc == other.allocator_) {
-            root_ = other.root_;
-            size_ = other.size_;
-            other.root_ = nullptr;
-            other.size_ = 0;
-        } else {
-            root_ = clone_subtree(other.root_);
-            size_ = other.size_;
-        }
-    }
+  prefix_tree(prefix_tree &&other) noexcept
+      : detail::mutex_guarded(std::move(other)),
+        allocator_(std::move(other.allocator_)),
+        root_(std::exchange(other.root_, other.allocate_node())),
+        size_(std::exchange(other.size_, 0)) {}
 
-    /**
-     * @brief Constructs a prefix_tree from a brace-enclosed list of key/value pairs.
-     * @param init  Key/value pairs to insert; later duplicates of an earlier key are ignored.
-     * @param alloc Allocator to use for all node allocations.
-     */
-    prefix_tree(std::initializer_list<value_type> init, const Allocator& alloc = Allocator())
-        : prefix_tree(alloc) {
-        insert(init.begin(), init.end());
+  prefix_tree &operator=(const prefix_tree &other) {
+    if (this == &other) {
+      return *this;
     }
+    std::scoped_lock lock(*this);
+    if constexpr (alloc_traits::propagate_on_container_copy_assignment::value) {
+      allocator_ = other.allocator_;
+    }
+    root_ = clone(other.root_);
+    size_ = other.size_;
+    return *this;
+  }
 
-    /// Destroys every node in the tree.
-    ~prefix_tree() {
-        if (root_) destroy_subtree(root_);
+  prefix_tree &operator=(prefix_tree &&other) noexcept(
+      alloc_traits::propagate_on_container_move_assignment::value ||
+      alloc_traits::is_always_equal::value) {
+    if (this == &other) {
+      return *this;
     }
+    std::scoped_lock lock(*this);
+    if constexpr (alloc_traits::propagate_on_container_move_assignment::value) {
+      allocator_ = std::move(other.allocator_);
+      root_ = std::move(other.root_);
+    } else if (allocator_ == other.allocator_) {
+      root_ = std::move(other.root_);
+    } else {
+      // Allocators differ and don't propagate: nodes allocated from
+      // other's resource can't be adopted, so fall back to a deep copy.
+      root_ = clone(other.root_);
+    }
+    size_ = other.size_;
+    other.root_ = other.allocate_node();
+    other.size_ = 0;
+    return *this;
+  }
 
-    /**
-     * @brief Copy assignment. Replaces the contents with a deep copy of `other`.
-     * @param other The prefix_tree to copy.
-     * @return `*this`.
-     */
-    prefix_tree& operator=(const prefix_tree& other) {
-        if (this == &other) return *this;
-        constexpr bool propagate =
-            std::allocator_traits<Allocator>::propagate_on_container_copy_assignment::value;
-        // `tmp`'s constructor locks `other` for its own duration (see the
-        // allocator-extended copy constructor); `*this` is locked separately
-        // below, so the two mutexes are never held at once here.
-        prefix_tree tmp(other, propagate ? other.allocator_ : allocator_);
-        std::scoped_lock lock(*this);
-        if constexpr (propagate) allocator_ = other.allocator_;
-        swap_contents(tmp);
-        return *this;
-    }
+  ~prefix_tree() = default;
 
-    /**
-     * @brief Move assignment. Replaces the contents by taking ownership of `other`'s storage.
-     * @param other The prefix_tree to move from; left empty.
-     * @return `*this`.
-     */
-    prefix_tree& operator=(prefix_tree&& other) noexcept(
-        std::allocator_traits<Allocator>::propagate_on_container_move_assignment::value ||
-        std::allocator_traits<Allocator>::is_always_equal::value) {
-        if (this == &other) return *this;
-        std::scoped_lock lock(*this);
-        if (root_) destroy_subtree(root_);
-        if constexpr (std::allocator_traits<
-                          Allocator>::propagate_on_container_move_assignment::value) {
-            allocator_ = std::move(other.allocator_);
-            root_ = other.root_;
-            size_ = other.size_;
-            other.root_ = nullptr;
-            other.size_ = 0;
-        } else {
-            if (allocator_ == other.allocator_) {
-                root_ = other.root_;
-                size_ = other.size_;
-                other.root_ = nullptr;
-                other.size_ = 0;
-            } else {
-                root_ = clone_subtree(other.root_);
-                size_ = other.size_;
-            }
-        }
-        return *this;
-    }
+  iterator begin() const {
+    std::vector<frame_type> stack{{root_.get(), 0}};
+    return iterator(std::move(stack), 1, acquire_shared_lock());
+  }
+  iterator end() const { return iterator(); }
+  iterator cbegin() const { return begin(); }
+  iterator cend() const { return end(); }
 
-    /**
-     * @brief Replaces the contents with a brace-enclosed list of key/value pairs.
-     * @param init Key/value pairs to insert; later duplicates of an earlier key are ignored.
-     * @return `*this`.
-     */
-    prefix_tree& operator=(std::initializer_list<value_type> init) {
-        std::scoped_lock lock(*this);
-        clear();
-        insert(init.begin(), init.end());
-        return *this;
-    }
+  [[nodiscard]] bool empty() const {
+    std::scoped_lock lock(*this);
+    return size_ == 0;
+  }
+  size_type size() const {
+    std::scoped_lock lock(*this);
+    return size_;
+  }
+  size_type max_size() const { return std::numeric_limits<size_type>::max(); }
 
-    /// @return A copy of the allocator used by this prefix_tree.
-    allocator_type get_allocator() const noexcept {
-        std::scoped_lock lock(*this);
-        return allocator_;
-    }
+  void clear() {
+    std::scoped_lock lock(*this);
+    root_ = allocate_node();
+    size_ = 0;
+  }
 
-    /**
-     * @brief Returns an iterator to the first key in lexicographic order.
-     *
-     * The returned iterator holds a reference-counted lock on this
-     * prefix_tree (see the class docs' Thread safety section) that is only
-     * released once it, and every copy taken from it, is destroyed.
-     * @return An iterator to the first key, or `end()` if empty.
-     */
-    iterator begin() {
-        auto guard = acquire_shared_lock();
-        iterator it;
-        it.stack_.push_back({root_, 0});
-        it.seek_value_forward();
-        it.lock_ = std::move(guard);
-        return it;
+  void swap(prefix_tree &other) noexcept {
+    if (this == &other) {
+      return;
     }
-    /// @return The past-the-end iterator. Holds no lock: it references no node.
-    iterator end() noexcept { return iterator(); }
-    /// @copydoc begin()
-    const_iterator begin() const { return cbegin(); }
-    /// @return The past-the-end const_iterator. Holds no lock: it references no node.
-    const_iterator end() const noexcept { return cend(); }
-    /// @copydoc begin()
-    const_iterator cbegin() const {
-        auto guard = acquire_shared_lock();
-        const_iterator it;
-        it.stack_.push_back({root_, 0});
-        it.seek_value_forward();
-        it.lock_ = std::move(guard);
-        return it;
+    std::scoped_lock lock(*this), lock2(other);
+    using std::swap;
+    if constexpr (alloc_traits::propagate_on_container_swap::value) {
+      swap(allocator_, other.allocator_);
     }
-    /// @return The past-the-end const_iterator. Holds no lock: it references no node.
-    const_iterator cend() const noexcept { return const_iterator(); }
+    swap(root_, other.root_);
+    swap(size_, other.size_);
+  }
 
-    /// @return True iff the prefix_tree contains no keys.
-    [[nodiscard]] bool empty() const noexcept {
-        std::scoped_lock lock(*this);
-        return size_ == 0;
+  template <std::ranges::input_range Sequence>
+  std::pair<iterator, bool> insert(const Sequence &sequence) {
+    std::scoped_lock lock(*this);
+    std::vector<frame_type> stack = locate_or_create(sequence);
+    node_type *target = stack.back().node;
+    bool inserted = !target->is_end;
+    if (inserted) {
+      target->is_end = true;
+      ++size_;
     }
-    /// @return The number of keys currently stored.
-    size_type size() const noexcept {
-        std::scoped_lock lock(*this);
-        return size_;
-    }
-    /// @return An upper bound on the number of nodes this prefix_tree could allocate.
-    size_type max_size() const noexcept {
-        std::scoped_lock lock(*this);
-        return std::allocator_traits<node_allocator_type>::max_size(node_allocator_type(allocator_));
-    }
+    return {iterator(std::move(stack), 1, acquire_shared_lock()), inserted};
+  }
 
-    /// Removes every key, leaving the prefix_tree empty. Invalidates all iterators.
-    void clear() noexcept {
-        std::scoped_lock lock(*this);
-        for (node* c : root_->children) destroy_subtree(c);
-        root_->children.clear();
-        root_->is_end = false;
-        root_->value.reset();
-        size_ = 0;
+  template <std::ranges::input_range Sequence>
+  size_type erase(const Sequence &sequence) {
+    std::scoped_lock lock(*this);
+    std::optional<std::vector<frame_type>> found = locate(sequence);
+    if (!found || !found->back().node->is_end) {
+      return 0;
     }
+    found->back().node->is_end = false;
+    --size_;
+    prune(*found);
+    return 1;
+  }
 
-    /**
-     * @brief Inserts `key` if absent, constructing its value in place from `args`.
-     * @tparam Args Constructor argument types forwarded to `T`.
-     * @param key  Key to insert.
-     * @param args Arguments forwarded to `T`'s constructor if `key` is not already present.
-     * @return A pair of an iterator to `key`'s element and whether insertion took place.
-     */
-    template <class... Args>
-    std::pair<iterator, bool> emplace(const key_type& key, Args&&... args) {
-        auto guard = acquire_shared_lock();
-        auto result = emplace_impl(key, std::forward<Args>(args)...);
-        result.first.lock_ = std::move(guard);
-        return result;
+  iterator erase(iterator pos) {
+    std::scoped_lock lock(*this);
+    if (pos == end()) {
+      return end();
     }
+    iterator next = pos;
+    ++next;
+    node_type *target = pos.stack_.back().node;
+    if (target->is_end) {
+      target->is_end = false;
+      --size_;
+      prune(pos.stack_);
+    }
+    return next;
+  }
 
-    /**
-     * @brief Inserts a copy of `value` under `key` if `key` is not already present.
-     * @param key   Key to insert.
-     * @param value Value to copy in if `key` is not already present.
-     * @return A pair of an iterator to `key`'s element and whether insertion took place.
-     */
-    std::pair<iterator, bool> insert(const key_type& key, const T& value) {
-        auto guard = acquire_shared_lock();
-        auto result = emplace_impl(key, value);
-        result.first.lock_ = std::move(guard);
-        return result;
+  template <std::ranges::input_range Sequence>
+  iterator find(const Sequence &sequence) const {
+    std::scoped_lock lock(*this);
+    std::optional<std::vector<frame_type>> found = locate(sequence);
+    if (!found || !found->back().node->is_end) {
+      return end();
     }
-    /**
-     * @brief Inserts `value` under `key` if `key` is not already present.
-     * @param key   Key to insert.
-     * @param value Value to move in if `key` is not already present.
-     * @return A pair of an iterator to `key`'s element and whether insertion took place.
-     */
-    std::pair<iterator, bool> insert(const key_type& key, T&& value) {
-        auto guard = acquire_shared_lock();
-        auto result = emplace_impl(key, std::move(value));
-        result.first.lock_ = std::move(guard);
-        return result;
-    }
-    /**
-     * @brief Inserts a copy of a key/value pair if its key is not already present.
-     * @param kv Key/value pair to insert.
-     * @return A pair of an iterator to the element and whether insertion took place.
-     */
-    std::pair<iterator, bool> insert(const value_type& kv) {
-        auto guard = acquire_shared_lock();
-        auto result = emplace_impl(kv.first, kv.second);
-        result.first.lock_ = std::move(guard);
-        return result;
-    }
-    /**
-     * @brief Inserts a key/value pair, moving the value, if its key is not already present.
-     * @param kv Key/value pair to insert.
-     * @return A pair of an iterator to the element and whether insertion took place.
-     */
-    std::pair<iterator, bool> insert(value_type&& kv) {
-        auto guard = acquire_shared_lock();
-        auto result = emplace_impl(kv.first, std::move(kv.second));
-        result.first.lock_ = std::move(guard);
-        return result;
-    }
+    return iterator(std::move(*found), 1, acquire_shared_lock());
+  }
 
-    /**
-     * @brief Inserts every key/value pair in `[first, last)` whose key is not already present.
-     *
-     * Locks once for the whole range rather than once per element, so the
-     * insertion is atomic with respect to other threads.
-     * @tparam InputIt Input iterator type dereferencing to something convertible to `value_type`.
-     * @param first Beginning of the range to insert.
-     * @param last  End of the range to insert.
-     */
-    template <class InputIt>
-    void insert(InputIt first, InputIt last) {
-        std::scoped_lock lock(*this);
-        for (; first != last; ++first) insert(*first);
-    }
-    /**
-     * @brief Inserts every key/value pair in a brace-enclosed list whose key is not already present.
-     * @param init Key/value pairs to insert.
-     */
-    void insert(std::initializer_list<value_type> init) {
-        std::scoped_lock lock(*this);
-        insert(init.begin(), init.end());
-    }
+  template <std::ranges::input_range Sequence>
+  bool contains(const Sequence &sequence) const {
+    return find(sequence) != end();
+  }
 
-    /**
-     * @brief Erases the element at `pos`, pruning any nodes left with neither a value nor children.
-     * @param pos Iterator to the element to erase; must be dereferenceable (not `end()`).
-     * @return An iterator to the element following the erased one, or `end()`.
-     */
-    iterator erase(const_iterator pos) {
-        auto guard = acquire_shared_lock();
-        iterator next = to_iterator(pos);
-        next.advance();
-        node* target = pos.current();
-        target->is_end = false;
-        target->value.reset();
-        --size_;
-        prune_dead_path(pos.stack_);
-        next.lock_ = std::move(guard);
-        return next;
-    }
+  template <std::ranges::input_range Sequence>
+  size_type count(const Sequence &sequence) const {
+    return contains(sequence) ? 1 : 0;
+  }
 
-    /**
-     * @brief Erases the element with the given key, if present.
-     * @param key Key to erase.
-     * @return 1 if `key` was present and erased, 0 otherwise.
-     */
-    size_type erase(const key_type& key) {
-        std::scoped_lock lock(*this);
-        const_iterator it = find_const(key);
-        if (it == cend()) return 0;
-        erase(it);
-        return 1;
-    }
+  template <std::ranges::input_range Sequence>
+  bool starts_with(const Sequence &prefix) const {
+    std::scoped_lock lock(*this);
+    return locate(prefix).has_value();
+  }
 
-    /**
-     * @brief Exchanges the contents of `*this` and `other` in constant time.
-     * @param other The prefix_tree to swap with.
-     */
-    void swap(prefix_tree& other) noexcept(std::allocator_traits<Allocator>::propagate_on_container_swap::value ||
-                                     std::allocator_traits<Allocator>::is_always_equal::value) {
-        if (this == &other) return;
-        std::scoped_lock lock(*this, other);
-        using std::swap;
-        if constexpr (std::allocator_traits<Allocator>::propagate_on_container_swap::value) {
-            swap(allocator_, other.allocator_);
-        }
-        swap(root_, other.root_);
-        swap(size_, other.size_);
+  template <std::ranges::input_range Sequence>
+  std::pair<iterator, iterator> prefix_range(const Sequence &prefix) const {
+    std::scoped_lock lock(*this);
+    std::optional<std::vector<frame_type>> found = locate(prefix);
+    if (!found) {
+      return {end(), end()};
     }
+    std::size_t min_depth = found->size();
+    return {iterator(std::move(*found), min_depth, acquire_shared_lock()),
+            end()};
+  }
 
-    /**
-     * @brief Accesses the value for `key`, throwing if absent.
-     * @param key Key to look up.
-     * @return A reference to the value associated with `key`.
-     * @throws std::out_of_range if `key` is not present.
-     */
-    T& at(const key_type& key) {
-        std::scoped_lock lock(*this);
-        node* n = find_node(key);
-        if (!n || !n->is_end) throw std::out_of_range("containers::custom::prefix_tree::at: key not found");
-        return n->value.value();
+  template <std::ranges::input_range Sequence>
+  size_type erase_prefix(const Sequence &prefix) {
+    std::scoped_lock lock(*this);
+    std::optional<std::vector<frame_type>> found = locate(prefix);
+    if (!found) {
+      return 0;
     }
-    /// @copydoc at(const key_type&)
-    const T& at(const key_type& key) const {
-        std::scoped_lock lock(*this);
-        node* n = find_node(key);
-        if (!n || !n->is_end) throw std::out_of_range("containers::custom::prefix_tree::at: key not found");
-        return n->value.value();
+    node_type *target = found->back().node;
+    size_type removed = count_end_nodes(target);
+    if (removed == 0) {
+      return 0;
     }
+    if (found->size() == 1) {
+      root_ = allocate_node();
+    } else {
+      node_type *parent = (*found)[found->size() - 2].node;
+      auto &siblings = parent->children;
+      siblings.erase(std::find_if(
+          siblings.begin(), siblings.end(),
+          [&](const auto &child) { return child.get() == target; }));
+    }
+    size_ -= removed;
+    return removed;
+  }
 
-    /**
-     * @brief Accesses the value for `key`, default-constructing and inserting one if absent.
-     * @param key Key to look up or insert.
-     * @return A reference to `key`'s (possibly newly default-constructed) value.
-     */
-    T& operator[](const key_type& key) {
-        std::scoped_lock lock(*this);
-        auto [it, inserted] = emplace_impl(key);
-        return it.current()->value.value();
+  friend bool operator==(const prefix_tree &lhs, const prefix_tree &rhs) {
+    if (&lhs == &rhs) {
+      return true;
     }
-
-    /**
-     * @brief Counts how many elements match `key` (0 or 1, since keys are unique).
-     * @param key Key to look up.
-     * @return 1 if `key` is present, 0 otherwise.
-     */
-    size_type count(const key_type& key) const {
-        std::scoped_lock lock(*this);
-        return contains(key) ? 1 : 0;
+    std::scoped_lock lock(lhs), lock2(rhs);
+    if (lhs.size_ != rhs.size_) {
+      return false;
     }
-
-    /**
-     * @brief Looks up `key`.
-     * @param key Key to look up.
-     * @return An iterator to `key`'s element, or `end()` if not present.
-     */
-    iterator find(const key_type& key) {
-        auto guard = acquire_shared_lock();
-        node* n = find_node(key);
-        if (!n || !n->is_end) return end();
-        iterator it = build_iterator_for_path<false>(key);
-        it.lock_ = std::move(guard);
-        return it;
-    }
-    /// @copydoc find(const key_type&)
-    const_iterator find(const key_type& key) const {
-        auto guard = acquire_shared_lock();
-        node* n = find_node(key);
-        if (!n || !n->is_end) return cend();
-        const_iterator it = build_iterator_for_path<true>(key);
-        it.lock_ = std::move(guard);
-        return it;
-    }
-
-    /**
-     * @brief Checks whether `key` is present.
-     * @param key Key to look up.
-     * @return True iff `key` is present.
-     */
-    bool contains(const key_type& key) const {
-        std::scoped_lock lock(*this);
-        node* n = find_node(key);
-        return n && n->is_end;
-    }
-
-    /**
-     * @brief Checks whether any stored key begins with `prefix`.
-     *
-     * O(prefix.size()): unlike a hash- or tree-based map, this does not need
-     * to scan the container's contents.
-     * @param prefix Prefix to test for.
-     * @return True iff at least one stored key begins with `prefix` (a key
-     *         equal to `prefix` counts).
-     */
-    bool starts_with(std::string_view prefix) const {
-        std::scoped_lock lock(*this);
-        return find_prefix_node(prefix) != nullptr;
-    }
-
-    /**
-     * @brief Returns the range of elements whose keys begin with `prefix`, in lexicographic order.
-     *
-     * Both returned iterators share one lock (see the class docs' Thread
-     * safety section), so the tree cannot be mutated by another thread for
-     * as long as either endpoint of the range remains alive.
-     * @param prefix Prefix to query.
-     * @return A `[first, second)` iterator pair; both are `end()` if no key has this prefix.
-     */
-    std::pair<iterator, iterator> prefix_range(std::string_view prefix) {
-        auto guard = acquire_shared_lock();
-        auto result = prefix_range_impl<false>(prefix);
-        result.first.lock_ = guard;
-        result.second.lock_ = std::move(guard);
-        return result;
-    }
-    /// @copydoc prefix_range(std::string_view)
-    std::pair<const_iterator, const_iterator> prefix_range(std::string_view prefix) const {
-        auto guard = acquire_shared_lock();
-        auto result = prefix_range_impl<true>(prefix);
-        result.first.lock_ = guard;
-        result.second.lock_ = std::move(guard);
-        return result;
-    }
-
-    /**
-     * @brief Erases every key beginning with `prefix` in a single structural operation.
-     *
-     * Detaches the subtree rooted at `prefix` (or, for an empty `prefix`, calls `clear()`)
-     * rather than erasing keys one at a time.
-     * @param prefix Prefix identifying the keys to erase.
-     * @return The number of keys removed.
-     */
-    size_type erase_prefix(std::string_view prefix) {
-        std::scoped_lock lock(*this);
-        if (prefix.empty()) {
-            size_type n = size_;
-            clear();
-            return n;
-        }
-        node* parent = root_;
-        node* cur = root_;
-        std::size_t last_idx = 0;
-        for (char c : prefix) {
-            std::size_t idx = lower_bound_index(cur, c);
-            if (idx >= cur->children.size() || cur->children[idx]->incoming_char != c) return 0;
-            parent = cur;
-            last_idx = idx;
-            cur = cur->children[idx];
-        }
-        parent->children.erase(parent->children.begin() + static_cast<std::ptrdiff_t>(last_idx));
-        size_type removed = count_and_destroy_subtree(cur);
-        size_ -= removed;
-        return removed;
-    }
-
-    /**
-     * @brief Compares two tries by content (same set of key/value pairs), not by internal structure.
-     * @return True iff `a` and `b` have the same size and every key in `a` maps to an equal value in `b`.
-     */
-    friend bool operator==(const prefix_tree& a, const prefix_tree& b) {
-        if (&a == &b) return true;
-        std::scoped_lock lock(a, b);
-        if (a.size_ != b.size_) return false;
-        auto ai = a.cbegin();
-        auto bi = b.cbegin();
-        for (; ai != a.cend(); ++ai, ++bi) {
-            if ((*ai).first != (*bi).first) return false;
-            if (!((*ai).second == (*bi).second)) return false;
-        }
-        return true;
-    }
-    /// @return The negation of `operator==`.
-    friend bool operator!=(const prefix_tree& a, const prefix_tree& b) { return !(a == b); }
-
-    /// Non-member `swap`, found via ADL; equivalent to `a.swap(b)`.
-    friend void swap(prefix_tree& a, prefix_tree& b) noexcept(noexcept(a.swap(b))) { a.swap(b); }
+    return std::equal(lhs.begin(), lhs.end(), rhs.begin(), rhs.end());
+  }
 
 private:
-    /// Allocator used (after rebinding) for every node allocation.
-    Allocator allocator_;
-    /// Sentinel root node; never represents a real key itself unless `""` was inserted.
-    node* root_;
-    /// Cached element count, kept in sync by every mutator.
-    size_type size_ = 0;
+  std::shared_ptr<node_type> allocate_node() const {
+    return std::allocate_shared<node_type>(allocator_);
+  }
 
-    /**
-     * @brief Allocates and default-constructs one node.
-     * @return A newly allocated node owned by the caller.
-     */
-    node* create_node() {
-        node_allocator_type node_alloc(allocator_);
-        node* p = node_alloc_traits::allocate(node_alloc, 1);
-        try {
-            node_alloc_traits::construct(node_alloc, p, allocator_);
-        } catch (...) {
-            node_alloc_traits::deallocate(node_alloc, p, 1);
-            throw;
-        }
-        return p;
+  std::shared_ptr<node_type> clone(const std::shared_ptr<node_type> &src) const {
+    std::shared_ptr<node_type> dst = allocate_node();
+    dst->element = src->element;
+    dst->is_end = src->is_end;
+    dst->children.reserve(src->children.size());
+    for (const auto &child : src->children) {
+      dst->children.push_back(clone(child));
     }
+    return dst;
+  }
 
-    /**
-     * @brief Destroys and deallocates a single node (not its children).
-     * @param p Node to destroy; must have been obtained from `create_node()`.
-     */
-    void destroy_node(node* p) {
-        node_allocator_type node_alloc(allocator_);
-        node_alloc_traits::destroy(node_alloc, p);
-        node_alloc_traits::deallocate(node_alloc, p, 1);
+  template <std::ranges::input_range Sequence>
+  std::optional<std::vector<frame_type>> locate(const Sequence &sequence) const {
+    std::vector<frame_type> stack{{root_.get(), 0}};
+    for (const auto &element : sequence) {
+      frame_type &top = stack.back();
+      auto &children = top.node->children;
+      auto it = std::lower_bound(
+          children.begin(), children.end(), element,
+          [](const auto &child, const auto &value) {
+            return *child->element < value;
+          });
+      if (it == children.end() || (*it)->element.value() != element) {
+        return std::nullopt;
+      }
+      top.next_child =
+          static_cast<std::size_t>(std::distance(children.begin(), it)) + 1;
+      stack.push_back({it->get(), 0});
     }
+    return stack;
+  }
 
-    /**
-     * @brief Iteratively destroys `start` and everything below it.
-     *
-     * Iterative (explicit stack) rather than recursive, so destruction depth
-     * is bounded by available memory rather than by call-stack size even for
-     * tries holding very long keys.
-     * @param start Subtree root to destroy.
-     */
-    void destroy_subtree(node* start) {
-        std::vector<node*> stack{start};
-        std::vector<node*> all;
-        while (!stack.empty()) {
-            node* n = stack.back();
-            stack.pop_back();
-            all.push_back(n);
-            for (node* c : n->children) stack.push_back(c);
-        }
-        for (node* n : all) destroy_node(n);
+  template <std::ranges::input_range Sequence>
+  std::vector<frame_type> locate_or_create(const Sequence &sequence) {
+    std::vector<frame_type> stack{{root_.get(), 0}};
+    for (const auto &element : sequence) {
+      frame_type &top = stack.back();
+      auto &children = top.node->children;
+      auto it = std::lower_bound(
+          children.begin(), children.end(), element,
+          [](const auto &child, const auto &value) {
+            return *child->element < value;
+          });
+      std::shared_ptr<node_type> child;
+      if (it != children.end() && (*it)->element.value() == element) {
+        child = *it;
+      } else {
+        child = allocate_node();
+        child->element = element;
+        it = children.insert(it, child);
+      }
+      top.next_child =
+          static_cast<std::size_t>(std::distance(children.begin(), it)) + 1;
+      stack.push_back({child.get(), 0});
     }
+    return stack;
+  }
 
-    /**
-     * @brief Destroys `start` and everything below it, counting value-bearing nodes first.
-     * @param start Subtree root to destroy.
-     * @return The number of `is_end` (key-bearing) nodes that were removed.
-     */
-    size_type count_and_destroy_subtree(node* start) {
-        std::vector<node*> stack{start};
-        std::vector<node*> all;
-        size_type count = 0;
-        while (!stack.empty()) {
-            node* n = stack.back();
-            stack.pop_back();
-            all.push_back(n);
-            if (n->is_end) ++count;
-            for (node* c : n->children) stack.push_back(c);
-        }
-        for (node* n : all) destroy_node(n);
-        return count;
+  void prune(std::vector<frame_type> &stack) {
+    for (std::size_t i = stack.size(); i-- > 1;) {
+      node_type *node = stack[i].node;
+      if (node->is_end || !node->children.empty()) {
+        break;
+      }
+      node_type *parent = stack[i - 1].node;
+      auto &siblings = parent->children;
+      siblings.erase(std::find_if(
+          siblings.begin(), siblings.end(),
+          [&](const auto &child) { return child.get() == node; }));
     }
+  }
 
-    /**
-     * @brief Iteratively deep-copies a subtree.
-     * @param src Subtree root to copy (from another prefix_tree, possibly using a different allocator).
-     * @return A newly allocated, independent copy of `src`'s subtree, owned by the caller.
-     * @throws Whatever `T`'s copy constructor or `create_node()` throws; on exception, any
-     *         partially-built subtree is destroyed before rethrowing.
-     */
-    node* clone_subtree(const node* src) {
-        node* new_root = create_node();
-        new_root->incoming_char = src->incoming_char;
-        try {
-            new_root->is_end = src->is_end;
-            if (src->is_end) new_root->value = src->value;
-            struct work_item {
-                const node* s;
-                node* d;
-            };
-            std::vector<work_item> stack{{src, new_root}};
-            while (!stack.empty()) {
-                work_item w = stack.back();
-                stack.pop_back();
-                w.d->children.reserve(w.s->children.size());
-                for (const node* sc : w.s->children) {
-                    node* dc = create_node();
-                    dc->incoming_char = sc->incoming_char;
-                    // Link `dc` into the tree (and onto the work stack)
-                    // before copying its value: if that copy throws, `dc`
-                    // must already be reachable from `new_root` so the catch
-                    // block's destroy_subtree(new_root) below finds and
-                    // frees it instead of leaking it.
-                    w.d->children.push_back(dc);
-                    stack.push_back({sc, dc});
-                    dc->is_end = sc->is_end;
-                    if (sc->is_end) dc->value = sc->value;
-                }
-            }
-        } catch (...) {
-            destroy_subtree(new_root);
-            throw;
-        }
-        return new_root;
+  static size_type count_end_nodes(const node_type *node) {
+    size_type count = node->is_end ? 1 : 0;
+    for (const auto &child : node->children) {
+      count += count_end_nodes(child.get());
     }
+    return count;
+  }
 
-    /**
-     * @brief Finds the insertion/lookup point for edge character `c` among `n`'s children.
-     * @param n Node whose children to search.
-     * @param c Edge character to search for.
-     * @return The index of the first child whose `incoming_char` is not less than `c`
-     *         (i.e. where `c` would need to be inserted to keep `children` sorted).
-     */
-    static std::size_t lower_bound_index(const node* n, char c) {
-        const auto& ch = n->children;
-        auto it = std::lower_bound(ch.begin(), ch.end(), c,
-                                    [](node* x, char val) { return x->incoming_char < val; });
-        return static_cast<std::size_t>(it - ch.begin());
-    }
-
-    /**
-     * @brief Finds the child of `n` reached via edge character `c`, if any.
-     * @param n Node whose children to search.
-     * @param c Edge character to search for.
-     * @return The matching child, or `nullptr` if `n` has no child for `c`.
-     */
-    static node* find_child(const node* n, char c) {
-        std::size_t idx = lower_bound_index(n, c);
-        if (idx < n->children.size() && n->children[idx]->incoming_char == c) return n->children[idx];
-        return nullptr;
-    }
-
-    /**
-     * @brief Walks from the root following `key`, one character per edge.
-     * @param key Character sequence to follow from the root.
-     * @return The node reached by consuming all of `key`, or `nullptr` if the path doesn't exist.
-     */
-    node* find_node(std::string_view key) const {
-        node* cur = root_;
-        for (char c : key) {
-            cur = find_child(cur, c);
-            if (!cur) return nullptr;
-        }
-        return cur;
-    }
-
-    /**
-     * @brief Walks from the root following `prefix`, one character per edge.
-     * @param prefix Character sequence to follow from the root.
-     * @return The node reached by consuming all of `prefix`, or `nullptr` if the path doesn't exist.
-     */
-    node* find_prefix_node(std::string_view prefix) const { return find_node(prefix); }
-
-    /**
-     * @brief Builds an iterator positioned at the node reached by following `key` from the root.
-     *
-     * Unlike `find_node()`, this also records, for every ancestor on the path, the index of the
-     * child taken -- the bookkeeping `trie_iterator` needs to backtrack correctly later.
-     * @tparam IsConst Whether to build an `iterator` or `const_iterator`.
-     * @param key Character sequence to follow from the root; must name an existing path.
-     * @return An iterator positioned at the node for `key`.
-     */
-    template <bool IsConst>
-    detail::trie_iterator<T, Allocator, IsConst> build_iterator_for_path(std::string_view key) const {
-        detail::trie_iterator<T, Allocator, IsConst> it;
-        it.stack_.push_back({root_, 0});
-        node* cur = root_;
-        for (char c : key) {
-            std::size_t idx = lower_bound_index(cur, c);
-            node* child = cur->children[idx];
-            it.stack_.back().next_child = idx + 1;
-            it.stack_.push_back({child, 0});
-            it.key_buffer_.push_back(c);
-            cur = child;
-        }
-        return it;
-    }
-
-    /**
-     * @brief Looks up `key`, returning a const_iterator suitable for use with `erase()`.
-     * @param key Key to look up.
-     * @return A const_iterator to `key`'s element, or `cend()` if not present.
-     */
-    const_iterator find_const(const key_type& key) const {
-        node* n = find_node(key);
-        if (!n || !n->is_end) return cend();
-        return build_iterator_for_path<true>(key);
-    }
-
-    /**
-     * @brief Converts a const_iterator's position into an equivalent (mutable) iterator.
-     * @param ci const_iterator to convert; consumed (its internals are moved from).
-     * @return An iterator at the same position as `ci`.
-     */
-    iterator to_iterator(const_iterator ci) {
-        iterator it;
-        it.stack_ = std::move(ci.stack_);
-        it.key_buffer_ = std::move(ci.key_buffer_);
-        return it;
-    }
-
-    /**
-     * @brief Shared implementation of `insert`/`emplace`: walks or grows the path for `key`,
-     *        then constructs its value from `args` if not already present.
-     * @tparam Args Constructor argument types forwarded to `T`.
-     * @param key  Key to insert.
-     * @param args Arguments forwarded to `T`'s constructor if `key` is not already present.
-     * @return A pair of an iterator to `key`'s element and whether insertion took place.
-     */
-    template <class... Args>
-    std::pair<iterator, bool> emplace_impl(const key_type& key, Args&&... args) {
-        iterator it;
-        it.stack_.push_back({root_, 0});
-        node* cur = root_;
-        for (char c : key) {
-            std::size_t idx = lower_bound_index(cur, c);
-            node* child;
-            if (idx < cur->children.size() && cur->children[idx]->incoming_char == c) {
-                child = cur->children[idx];
-            } else {
-                child = create_node();
-                child->incoming_char = c;
-                cur->children.insert(cur->children.begin() + static_cast<std::ptrdiff_t>(idx), child);
-            }
-            it.stack_.back().next_child = idx + 1;
-            it.stack_.push_back({child, 0});
-            it.key_buffer_.push_back(c);
-            cur = child;
-        }
-        bool inserted = false;
-        if (!cur->is_end) {
-            cur->value.emplace(std::forward<Args>(args)...);
-            cur->is_end = true;
-            ++size_;
-            inserted = true;
-        }
-        return {it, inserted};
-    }
-
-    /**
-     * @brief Shared implementation of the two `prefix_range` overloads.
-     * @tparam IsConst Whether to build `iterator`s or `const_iterator`s.
-     * @param prefix Prefix to query.
-     * @return A `[first, second)` iterator pair; both are `end()`-equivalent if no key has this prefix.
-     */
-    template <bool IsConst>
-    std::pair<detail::trie_iterator<T, Allocator, IsConst>, detail::trie_iterator<T, Allocator, IsConst>>
-    prefix_range_impl(std::string_view prefix) const {
-        using it_t = detail::trie_iterator<T, Allocator, IsConst>;
-        it_t start;
-        start.stack_.push_back({root_, 0});
-        node* cur = root_;
-        for (char c : prefix) {
-            std::size_t idx = lower_bound_index(cur, c);
-            if (idx >= cur->children.size() || cur->children[idx]->incoming_char != c) {
-                return {it_t(), it_t()};
-            }
-            start.stack_.back().next_child = idx + 1;
-            node* child = cur->children[idx];
-            start.stack_.push_back({child, 0});
-            start.key_buffer_.push_back(c);
-            cur = child;
-        }
-        it_t finish = start;
-        start.seek_value_forward();
-        finish.skip_subtree_and_seek();
-        return {start, finish};
-    }
-
-    /**
-     * @brief Removes now-useless (no value, no children) nodes walking up from the deepest entry
-     *        of `path` towards, but excluding, the root.
-     * @param path Root-to-erased-node path, as captured by the erased element's iterator
-     *             before the element's `is_end`/`value` were cleared.
-     */
-    void prune_dead_path(const std::vector<detail::trie_frame<T, Allocator>>& path) {
-        for (std::size_t i = path.size(); i-- > 1;) {
-            node* n = path[i].n;
-            node* parent = path[i - 1].n;
-            if (n->is_end || !n->children.empty()) break;
-            std::size_t child_idx = path[i - 1].next_child - 1;
-            parent->children.erase(parent->children.begin() + static_cast<std::ptrdiff_t>(child_idx));
-            destroy_node(n);
-        }
-    }
-
-    /**
-     * @brief Swaps just `root_` and `size_` (not the allocator) with `other`.
-     * @param other The prefix_tree to swap storage with.
-     */
-    void swap_contents(prefix_tree& other) noexcept {
-        std::swap(root_, other.root_);
-        std::swap(size_, other.size_);
-    }
+  Allocator allocator_;
+  std::shared_ptr<node_type> root_;
+  size_type size_ = 0;
 };
 
-}  // namespace containers::custom
+template <typename ElementType, typename Allocator>
+void swap(prefix_tree<ElementType, Allocator> &lhs,
+          prefix_tree<ElementType, Allocator> &rhs) noexcept {
+  lhs.swap(rhs);
+}
+
+} // namespace containers::custom
