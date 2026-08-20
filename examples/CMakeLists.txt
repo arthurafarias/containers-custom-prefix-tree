@@ -1,0 +1,3 @@
+add_executable(containers_custom_prefix_tree_basic_usage basic_usage.cpp)
+target_link_libraries(containers_custom_prefix_tree_basic_usage PRIVATE containers::custom::prefix_tree)
+

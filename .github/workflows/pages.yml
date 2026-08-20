@@ -1,0 +1,73 @@
+name: docs & coverage -> GitHub Pages
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y doxygen graphviz gcovr
+
+      - name: Configure (coverage-instrumented tests)
+        run: >
+          cmake -S . -B build
+          -DCMAKE_BUILD_TYPE=Debug
+          -DCONTAINERS_CUSTOM_PREFIX_TREE_COVERAGE=ON
+          -DCONTAINERS_CUSTOM_PREFIX_TREE_BUILD_EXAMPLES=OFF
+          -DCONTAINERS_CUSTOM_PREFIX_TREE_BUILD_BENCHMARKS=OFF
+
+      - name: Build tests
+        run: cmake --build build -j"$(nproc)" --target containers_custom_prefix_tree_tests
+
+      - name: Run tests
+        run: ctest --test-dir build --output-on-failure
+
+      - name: Generate coverage report
+        run: |
+          mkdir -p site/coverage
+          gcovr --root . \
+            --filter 'include/containers/custom/.*' \
+            --object-directory build \
+            --html-details site/coverage/index.html \
+            --print-summary
+
+      - name: Generate API docs
+        run: doxygen Doxyfile
+
+      - name: Assemble site
+        run: |
+          cp docs/index.html site/index.html
+          cp -r docs/api site/api
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

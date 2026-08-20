@@ -1,0 +1,10 @@
+build/
+build-*/
+*.o
+*.obj
+compile_commands.json
+.cache/
+docs/api/
+site/
+*.gcda
+*.gcno

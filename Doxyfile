@@ -1,0 +1,31 @@
+# Minimal Doxygen config for containers-custom-prefix-tree.
+# Doxygen fills in its own defaults for anything not set here.
+# Run from the repository root: `doxygen Doxyfile`
+
+PROJECT_NAME           = "containers::custom::prefix_tree"
+PROJECT_BRIEF          = "Header-only, PMR-aware, thread-safe prefix tree (trie) container"
+
+INPUT                  = README.md include
+USE_MDFILE_AS_MAINPAGE = README.md
+FILE_PATTERNS          = *.hpp *.md
+RECURSIVE              = YES
+
+OUTPUT_DIRECTORY       = docs/api
+
+GENERATE_HTML          = YES
+GENERATE_LATEX         = NO
+GENERATE_TREEVIEW      = YES
+DISABLE_INDEX          = NO
+FULL_SIDEBAR           = NO
+SORT_MEMBER_DOCS       = NO
+SORT_BRIEF_DOCS        = NO
+
+EXTRACT_ALL            = NO
+EXTRACT_PRIVATE        = YES
+EXTRACT_STATIC         = YES
+WARN_IF_UNDOCUMENTED   = YES
+WARN_IF_DOC_ERROR      = YES
+WARN_NO_PARAMDOC       = YES
+
+MACRO_EXPANSION        = NO
+QUIET                  = YES
